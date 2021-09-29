@@ -1,0 +1,269 @@
+---
+title: "3_final_analyses"
+author: "Joshua Levy"
+date: "7/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# imports
+```{r}
+library(reticulate)
+library(rstanarm)
+library(tidyverse)
+library(sva)
+library(brms)
+library(loo)
+library(bayesplot)
+library(bayestestR)
+library(bridgesampling)
+library(projpred)
+
+get.hdi<-function(x,ci=0.9){
+  hdi.val<-hdi(x, ci=ci)
+  return(c(mean(x),median(x),sd(x),mad(x),hdi.val$CI_low,hdi.val$CI_high))
+}
+
+python<-use_python(conda_python(envname = "py37_2", conda = "auto"))
+pd<-import("pandas")
+sklearn<-import("sklearn")
+pickle<-import("pickle")
+py <- import_builtins()
+```
+
+
+# load data
+```{r}
+data<-pd$read_pickle("../../data/final_splits.pkl")
+
+for (nm in names(data)){
+  for (nm2 in names(data[[nm]])){
+  data[[nm]][[nm2]]<-py_to_r(data[[nm]][[nm2]])
+  }
+  data[[nm]]$data<-data[[nm]]$X
+  data[[nm]]$data$y<-as.numeric(data[[nm]]$y)
+  data[[nm]]$data$batch<-data[[nm]]$group
+  
+  data[[nm]]$data2<-data[[nm]]$X
+  data[[nm]]$data2$y<-as.numeric(data[[nm]]$y)
+  data[[nm]]$data2$batch<-data[[nm]]$group
+  data[[nm]]$data2$roi_x<-unlist(data[[nm]]$coords$roi_x)
+  data[[nm]]$data2$roi_y<-unlist(data[[nm]]$coords$roi_y)
+}
+```
+
+# 1. bglmm
+# extract predictions
+```{r}
+
+results<-list()
+  for (nm in names(data)){
+    results[[nm]]<-list()
+      for (cv.idx in 1:10){
+        print(paste(nm,as.character(cv.idx)))
+        if (nm=="mets_overall"){
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + intra + inter + (1 | batch)")
+        } else {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + (1 | batch)")
+        }
+        fit <- brm(form, data[[nm]]$data[data[[nm]]$splits[,cv.idx],],
+                      cores = 4,
+                      seed=42, 
+                      family=bernoulli,
+                      prior=prior(horseshoe(df = 3, par_ratio = 0.05)), # lasso
+                      control=list(adapt_delta=0.95),
+               save_pars = save_pars(all = TRUE))
+        y.true<-data[[nm]]$data[!data[[nm]]$splits[,cv.idx],"y"]
+        y.pred<-predict(fit, data[[nm]]$data[!data[[nm]]$splits[,cv.idx],], allow_new_levels=T)[,1]
+        results[[nm]][[cv.idx]]<-list(y_true=y.true,
+                                y_pred=y.pred)
+      }
+  }
+  pickle$dump(r_to_py(results),py$open("../../results/bglmm.pkl","wb"))
+```
+
+# model explanation
+```{r}
+mcmc_intervals(fit,pars=paste("b_",colnames(data[[nm]]$X),sep=""))
+```
+
+# 2. BART
+```{r}
+library(stan4bart)
+set.seed(42)
+results<-list()
+for (nm in names(data)){
+  results[[nm]]<-list()
+  for (cv.idx in 1:10){
+    print(paste(nm,as.character(cv.idx)))
+    if (nm=="mets_overall"){
+      fit <- mstan4bart(y ~ bart(CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34) * (intra + inter) + age + sex + (1 | batch) , data[[nm]]$data[data[[nm]]$splits[,cv.idx],],
+                  cores = 1,
+                  verbose = 1,
+                  seed=42,
+                  test=data[[nm]]$data[!data[[nm]]$splits[,cv.idx],],
+                  offset=NULL,
+                  weights=NULL)
+    } else {
+      fit <- mstan4bart(y ~ bart(CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34)  + age + sex + (1 | batch) , data[[nm]]$data[data[[nm]]$splits[,cv.idx],],
+                  cores = 1,
+                  verbose = 1,
+                  seed=42,
+                  test=data[[nm]]$data[!data[[nm]]$splits[,cv.idx],],
+                  offset=NULL,
+                  weights=NULL)
+    }
+    
+    y.true<-data[[nm]]$data[!data[[nm]]$splits[,cv.idx],"y"]
+    ranef<-fitted(fit,sample="train",type="ranef")$batch[1,]
+    for (batch in as.character(0:37)){
+      if (!batch%in%names(ranef)){
+        ranef[[batch]]<-0
+      }
+    }
+    indiv.ranef<-sapply(as.character(data[[nm]]$data[!data[[nm]]$splits[,cv.idx],]$batch),function(x){ranef[[x]]})
+    y.pred<-pnorm(fitted(fit,sample="test",type="indiv.fixef")+fitted(fit,sample="test",type="indiv.bart")+indiv.ranef)
+    results[[nm]][[cv.idx]]<-list(y_true=y.true,
+                            y_pred=y.pred)
+  }
+}
+pickle$dump(r_to_py(results),py$open("../../results/bart.pkl","wb"))
+```
+
+# 3. bglmm interaction from GPBoost
+```{r}
+results<-list()
+for (nm in names(data)){
+    results[[nm]]<-list()
+      for (cv.idx in 1:10){
+        print(paste(nm,as.character(cv.idx)))
+        if (nm=="mets_overall"){
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + intra + inter + CD14:age+Fibronectin:age+CD20:age+CD163:age+Beta_2_microglobulin:age+age:sex+FOXP3:age+GZMB:age+Fibronectin:CD14+CD40:age + (1 | batch)")
+        } else if (nm=="mets_intra") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + CD45:CD8+Beta_2_microglobulin:age+CD20:age+Beta_2_microglobulin:FOXP3+CD40:age+FOXP3:CD66b+CD11c:CD8+Fibronectin:age+CD8:age+PanCk:CD8 + (1 | batch)")
+        } else if (nm=="mets_inter") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + Fibronectin:age+Fibronectin:CD14+Beta_2_microglobulin:CD14+CD163:age+CTLA4:CD14+CD14:age+Beta_2_microglobulin:CD27+GZMB:age+CD14:CD66b+CD68:CTLA4 + (1 | batch)")
+        } else if (nm=="mets_away") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + CD14:age+CD127:CD14+Fibronectin:CD14+CD25:CD14+PanCk:age+FAP_alpha:CD163+CD14:FOXP3+CD4:CD14+Beta_2_microglobulin:FOXP3+FOXP3:age + (1 | batch)")
+        } else if (nm=="macro_oos") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + PanCk:CTLA4+PanCk:CD34+CD68:PanCk+PanCk:FAP_alpha+CD11c:PanCk+PanCk:CD27+PanCk:CD56+PanCk:CD127+Fibronectin:PanCk+PanCk:CD45 + (1 | batch)")
+        } else if (nm=="macro_ws") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + PanCk:CTLA4+PanCk:CD34+PanCk:FAP_alpha+CD68:PanCk+Fibronectin:PanCk+PD_L1:PanCk+PanCk:CD56+PanCk:CD44+CD4:PanCk+PanCk:CD80
+ + (1 | batch)")
+        }
+        fit <- brm(form, data[[nm]]$data[data[[nm]]$splits[,cv.idx],],
+                      cores = 4,
+                      seed=42, 
+                      family=bernoulli,
+                      prior=prior(horseshoe(df = 3, par_ratio = 0.05)), # lasso
+                      control=list(adapt_delta=0.95),
+               save_pars = save_pars(all = TRUE))
+        y.true<-data[[nm]]$data[!data[[nm]]$splits[,cv.idx],"y"]
+        y.pred<-predict(fit, data[[nm]]$data[!data[[nm]]$splits[,cv.idx],], allow_new_levels=T)[,1]
+        results[[nm]][[cv.idx]]<-list(y_true=y.true,
+                                y_pred=y.pred)
+      }
+  }
+pickle$dump(r_to_py(results),py$open("../../results/bglmm_int.pkl","wb"))
+```
+
+# model interpretation
+```{r}
+# top 10 interactions extracted from gpboost
+mods<-list()
+for (nm in names(data)){
+        print(paste(nm))
+        if (nm=="mets_overall"){
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + intra + inter + CD14:age+Fibronectin:age+CD20:age+CD163:age+Beta_2_microglobulin:age+age:sex+FOXP3:age+GZMB:age+Fibronectin:CD14+CD40:age + (1 | batch)")
+        } else if (nm=="mets_intra") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + CD45:CD8+Beta_2_microglobulin:age+CD20:age+Beta_2_microglobulin:FOXP3+CD40:age+FOXP3:CD66b+CD11c:CD8+Fibronectin:age+CD8:age+PanCk:CD8 + (1 | batch)")
+        } else if (nm=="mets_inter") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + Fibronectin:age+Fibronectin:CD14+Beta_2_microglobulin:CD14+CD163:age+CTLA4:CD14+CD14:age+Beta_2_microglobulin:CD27+GZMB:age+CD14:CD66b+CD68:CTLA4 + (1 | batch)")
+        } else if (nm=="mets_away") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + CD14:age+CD127:CD14+Fibronectin:CD14+CD25:CD14+PanCk:age+FAP_alpha:CD163+CD14:FOXP3+CD4:CD14+Beta_2_microglobulin:FOXP3+FOXP3:age + (1 | batch)")
+        } else if (nm=="macro_oos") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + PanCk:CTLA4+PanCk:CD34+CD68:PanCk+PanCk:FAP_alpha+CD11c:PanCk+PanCk:CD27+PanCk:CD56+PanCk:CD127+Fibronectin:PanCk+PanCk:CD45 + (1 | batch)")
+        } else if (nm=="macro_ws") {
+          form<-as.formula("y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + PanCk:CTLA4+PanCk:CD34+PanCk:FAP_alpha+CD68:PanCk+Fibronectin:PanCk+PD_L1:PanCk+PanCk:CD56+PanCk:CD44+CD4:PanCk+PanCk:CD80
+ + (1 | batch)")
+        }
+  # horseshoe lasso feature selection
+        fit <- brm(form, data[[nm]]$data,
+                      cores = 4,
+                      seed=42, 
+                      family=bernoulli,
+                      prior=prior(horseshoe(df = 3, par_ratio = 0.05)), 
+                      control=list(adapt_delta=0.95),
+               save_pars = save_pars(all = TRUE),
+               iter=2000)
+        fit.df<-as.data.frame(fit) %>% select(starts_with("b_"),-contains("Intercept"))
+        new.terms<-str_remove(colnames(fit.df[,!apply(fit.df,2,function(x){get.hdi(x,0.7)[6]>0&get.hdi(x,0.7)[5]<0})]),"b_")
+        main.effects<-unique(unlist(str_split(new.terms[grepl(":",new.terms)],":")))
+        main.effects<-main.effects[!main.effects%in%new.terms]
+        new.terms<-c(main.effects,new.terms)
+        form<-as.formula(paste("y~",paste(new.terms,collapse="+"),"+(1|batch)"))
+        dat2<-data[[nm]]$data
+        if (nm!="mets_overall"){dat2[,1:(ncol(dat2)-2)]<-scale(dat2[,1:(ncol(dat2)-2)])}
+        else {dat2[,1:(ncol(dat2)-4)]<-scale(dat2[,1:(ncol(dat2)-4)])}
+        # unpenalized model
+        fit <- brm(form, dat2,
+                      cores = 4,
+                      seed=42, 
+                      family=bernoulli,
+               save_pars = save_pars(all = TRUE),
+               iter=2000)
+      mods[[nm]]<-as.data.frame(fit)
+}
+
+saveRDS(mods,"../../interactions/bglmm.interations.rds")
+```
+
+# model interpretation
+```{r}
+top.preds<-list()
+for (nm in names(mods)){
+  fit.df<-mods[[nm]] %>% select(starts_with("b_"),-contains("Intercept"))
+  fit.df<-fit.df[,order(-abs(colMeans(fit.df)))]
+  top.preds[[nm]]<-c(str_remove(colnames(fit.df),"b_"),rep(NA,14-ncol(fit.df)))
+  colnames(fit.df)<-str_remove(colnames(fit.df),"b_")
+  mcmc_intervals(fit.df)
+}
+write.csv(as.data.frame(top.preds),"top.pred.bglmm.csv")
+
+```
+
+# 4. bglmm with gaussian process spatial autocorrelation
+# extract predictions
+```{r}
+library(brms)
+library(loo)
+library(bayesplot)
+library(bayestestR)
+library(bridgesampling)
+
+results<-list()
+  for (nm in names(data)){
+    if (grepl("macro", nm, fixed = TRUE)){
+    results[[nm]]<-list()
+      for (cv.idx in 1:10){
+        print(paste(nm,as.character(cv.idx)))
+        # horseshoe lasso 
+        fit <- brm(y ~ CD3 + CD11c + Rb_IgG + PD_L1 + PD_1 + Fibronectin + Beta_2_microglobulin + CD20 + CD4 + Ms_IgG1 + CD68 + HLA_DR + Ki_67 + PanCk + GZMB + CD56 + SMA + CD45 + CD8 + Ms_IgG2a + CTLA4 + CD27 + CD44 + CD25 + CD127 + ICOS + CD80 + PD_L2 + CD40 + FAP_alpha + CD14 + FOXP3 + CD163 + CD66b + CD45RO + CD34 + age + sex + gp(roi_x,roi_y,c=5/4,k=5,gr=T) + (1 | batch), data[[nm]]$data2[data[[nm]]$splits[,cv.idx],],
+                      cores = 4,
+                      seed=42, 
+                      family=bernoulli,
+                      prior=prior(horseshoe(df = 3, par_ratio = 0.05)), 
+                      control=list(adapt_delta=0.95),
+               save_pars = save_pars(all = TRUE))
+        y.true<-data[[nm]]$data2[!data[[nm]]$splits[,cv.idx],"y"]
+        y.pred<-predict(fit, data[[nm]]$data2[!data[[nm]]$splits[,cv.idx],], allow_new_levels=T)[,1]
+        results[[nm]][[cv.idx]]<-list(y_true=y.true,
+                                y_pred=y.pred)
+      }
+    }
+  }
+  pickle$dump(r_to_py(results),py$open("../../results/bglmm_gp.pkl","wb"))
+```
